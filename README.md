@@ -100,7 +100,7 @@ The pre-quantized variant loads in under 2 minutes on a T4 and requires no separ
 - `bf16` auto-detection via `is_bfloat16_supported()` - uses bf16 on A100, fp16 on T4
 - `lora_dropout=0`: Stage 1 raw text is large enough that regularisation is not needed
 
-**Training result:** Loss converged from ~2.1 to ~0.4 over 45 steps. See ![Report Image](reports/stage1_train_loss.png)
+**Training result:** Loss converged from ~2.1 to ~0.4 over 45 steps. See ![Report Image](reports/training_metrics/stage1_train_loss.png)
 
 ---
 
@@ -127,9 +127,9 @@ The pre-quantized variant loads in under 2 minutes on a T4 and requires no separ
 - `learning_rate=1e-4` — lower than Stage 1 to preserve domain knowledge while teaching format
 - `eval_strategy="steps"` every 10 steps — tracks validation loss to detect overfitting
 
-**Training result:** Loss converged from ~2.7 to ~0.5 over 60 steps. ROUGE-L improved from Base 0.125 to SFT 0.242 (+0.118). See ![Report Image](reports/stage2_train_loss.png)
+**Training result:** Loss converged from ~2.7 to ~0.5 over 60 steps. ROUGE-L improved from Base 0.125 to SFT 0.242 (+0.118). See ![Report Image](reports/training_metrics/stage2_train_loss.png)
 
- and ![Report Image](reports/rouge_score.png).
+ and ![Report Image](reports/training_metrics/rouge_score.png).
 
 ---
 
@@ -163,9 +163,9 @@ The pre-quantized variant loads in under 2 minutes on a T4 and requires no separ
 - `rewards/margins` increased from 0 → ~5.5 (training) | ~3.0 (validation)
 - `rewards/accuracies` reached 1.0 on both training and validation sets — the model correctly ranks chosen over rejected on all pairs. Model stabilises at 1.0, confirming generalisation beyond the training pairs.
 
-See ![Report Image](reports/dpo_train.png) 
+See ![Report Image](reports/training_metrics/dpo_train.png) 
 
-and ![Report Image](reports/dpo_eval.png)
+and ![Report Image](reports/training_metrics/dpo_eval.png)
 
 ---
 
