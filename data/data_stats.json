@@ -1,0 +1,40 @@
+{
+  "non_instruction_paragraphs": 110,
+  "instruction_pairs": 296,
+  "preference_pairs": 100,
+  "topics_covered": [
+    "diabetes",
+    "hypertension",
+    "cardiovascular",
+    "respiratory",
+    "mental_health",
+    "medications",
+    "nutrition_lifestyle",
+    "infection_prevention",
+    "general"
+  ],
+  "file_sizes_kb": {
+    "non_instruction_data.txt": 55.3,
+    "instruction_dataset.jsonl": 239.2,
+    "preference_dataset.jsonl": 100.6
+  },
+  "rubric_targets": {
+    "non_instruction": {
+      "min_required": 50,
+      "delivered": 110,
+      "2x_met": true
+    },
+    "instruction": {
+      "min_required": 100,
+      "delivered": 296,
+      "2x_met": true
+    },
+    "preference": {
+      "min_required": 50,
+      "delivered": 100,
+      "2x_met": true
+    }
+  },
+  "all_targets_met": true,
+  "gpt4_generation_script": "generate_with_gpt4.py"
+}

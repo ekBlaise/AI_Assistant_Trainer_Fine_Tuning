@@ -1,0 +1,48 @@
+# ============================================================
+# Healthcare AI Assistant — Requirements
+# Assignment 04: Three-Stage LLM Fine-Tuning Pipeline
+# ============================================================
+
+# ── Core fine-tuning stack (pinned for reproducibility) ─────
+unsloth
+transformers==4.56.2
+trl==0.22.2
+datasets>=2.14.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+accelerate>=0.27.0
+
+# ── Model training ───────────────────────────────────────────
+torch>=2.1.0
+scipy>=1.11.0             # Required by some PEFT / evaluation utilities
+
+# ── Evaluation metrics ───────────────────────────────────────
+rouge_score>=0.1.2        # ROUGE-L scoring (used in NB02 + NB03)
+bert_score>=0.3.13        # BERTScore semantic similarity (used in NB05)
+numpy>=1.24.0
+
+# ── Data handling ────────────────────────────────────────────
+pandas>=2.0.0
+
+# ── Data ingestion (multi-format pipeline) ───────────────────
+pymupdf>=1.23.0           # PDF text extraction  (import as fitz)
+python-docx>=1.1.0        # DOCX extraction
+pytesseract>=0.3.10       # Scanned PDF OCR     (requires tesseract binary)
+pdf2image>=1.16.3         # PDF → image for OCR
+
+# ── Web application ──────────────────────────────────────────
+gradio>=4.0.0
+
+# ── Experiment tracking (optional but recommended) ───────────
+wandb>=0.16.0             # Set USE_WANDB=True in Cell 3 of each notebook
+
+# ── Tokenizer utilities ──────────────────────────────────────
+sentencepiece>=0.1.99     # Required by Qwen2.5 and LLaMA tokenizers
+protobuf>=3.20.0          # Required by sentencepiece
+
+# ── Notebook utilities ───────────────────────────────────────
+ipywidgets>=8.0.0         # Progress bars in Jupyter/Colab
+matplotlib>=3.7.0         # Training loss curve plots (NB05 Fix 3)
+
+# ── GPT-4 data generation script (optional) ──────────────────
+openai>=1.0.0             # Only needed if running data/generate_with_gpt4.py
