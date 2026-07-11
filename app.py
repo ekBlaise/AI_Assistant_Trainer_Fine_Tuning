@@ -700,6 +700,94 @@ def train_one_stage(
 # EVALUATION
 # ═════════════════════════════════════════════════════════════════════════════
 
+def run_three_way_eval(questions_text: str, system_prompt: str, max_tokens: int, progress=gr.Progress()):
+    """
+    Mirror the DPO notebook's Base vs SFT vs DPO comparison:
+    run the same questions through all three models, show answers side by side,
+    and compute ROUGE-L using the DPO answer as the reference (as the notebook does).
+    Prefers the user's freshly trained models when available, else the Hub pipeline.
+    """
+    questions = [q.strip() for q in questions_text.split("\n") if q.strip()] or DEFAULT_EVAL_QUESTIONS
+
+    # Resolve which concrete model to use for each stage (trained first, else Hub)
+    def _latest(stage_code):
+        hits = [(lbl, e) for lbl, e in _trained_registry.items() if e["stage"] == stage_code]
+        return hits[-1] if hits else None
+
+    plan = []
+    for stage_code, nice, hub_repo in [
+        ("PT",  "Base", HF_REPOS["Base  (Stage 1 merged)"]),
+        ("SFT", "SFT",  HF_REPOS["SFT   (Stage 2 merged)"]),
+        ("DPO", "DPO",  HF_REPOS["DPO   (Final model)"]),
+    ]:
+        found = _latest(stage_code)
+        if found:
+            plan.append((nice, f"Trained · {found[0]}", found[1]["path"]))
+        else:
+            plan.append((nice, nice, hub_repo))
+
+    try:
+        from rouge_score import rouge_scorer as rs_mod
+        scorer_obj = rs_mod.RougeScorer(["rougeL"], use_stemmer=True)
+        has_rouge = True
+    except ImportError:
+        has_rouge = False
+
+    # Generate answers per model, loading each once
+    answers = {"Base": {}, "SFT": {}, "DPO": {}}
+    log_lines = []
+    total_steps = len(plan) * len(questions)
+    step = 0
+    for nice, label, repo in plan:
+        ok, msg = _load_model(repo, label)
+        if not ok:
+            log_lines.append(f"❌ {nice}: could not load ({msg})")
+            for q in questions:
+                answers[nice][q] = "N/A (model unavailable)"
+            continue
+        m, t = _loaded_models[label]
+        log_lines.append(f"✅ {nice} ← {label}")
+        for q in questions:
+            step += 1
+            progress(step / total_steps, desc=f"{nice}: {q[:40]}...")
+            answers[nice][q] = _generate(m, t, q, system_prompt, int(max_tokens))
+
+    # Build side-by-side table; ROUGE-L vs DPO answer (matches notebook)
+    rows = []
+    base_scores, sft_scores = [], []
+    for i, q in enumerate(questions):
+        b = answers["Base"].get(q, "")
+        s = answers["SFT"].get(q, "")
+        d = answers["DPO"].get(q, "")
+        rb = rs_ = 0.0
+        if has_rouge and d:
+            rb  = scorer_obj.score(d, b)["rougeL"].fmeasure if b and "N/A" not in b else 0.0
+            rs_ = scorer_obj.score(d, s)["rougeL"].fmeasure if s and "N/A" not in s else 0.0
+            base_scores.append(rb); sft_scores.append(rs_)
+        rows.append({
+            "#": i + 1,
+            "Question": q,
+            "Base": b[:220] + ("..." if len(b) > 220 else ""),
+            "SFT":  s[:220] + ("..." if len(s) > 220 else ""),
+            "DPO":  d[:220] + ("..." if len(d) > 220 else ""),
+            "ROUGE Base→DPO": f"{rb:.3f}" if has_rouge else "N/A",
+            "ROUGE SFT→DPO":  f"{rs_:.3f}" if has_rouge else "N/A",
+        })
+
+    df = pd.DataFrame(rows)
+    avg_b = sum(base_scores)/len(base_scores) if base_scores else 0.0
+    avg_s = sum(sft_scores)/len(sft_scores) if sft_scores else 0.0
+    summary = (
+        "✅ Three-way comparison complete\n"
+        f"   Models — Base: {plan[0][1]} · SFT: {plan[1][1]} · DPO: {plan[2][1]}\n"
+        f"   Questions: {len(questions)}\n"
+        + (f"   Avg ROUGE-L vs DPO reference — Base {avg_b:.3f} → SFT {avg_s:.3f}\n"
+           f"   (higher = closer to the DPO model's answers; DPO scores 1.000 as its own reference)"
+           if has_rouge else "   (install rouge_score for ROUGE-L metrics)")
+    )
+    return "\n".join(log_lines), df, summary
+
+
 def run_evaluation(questions_text: str, system_prompt: str, progress=gr.Progress()):
     global _active_model, _active_tok
     if _active_model is None:
@@ -1214,19 +1302,42 @@ with gr.Blocks(title="Fine-Tuning Studio", theme=THEME, css=CUSTOM_CSS) as demo:
 
         # ══════════════════════════════ EVALUATE ══════════════════════════════
         with gr.Tab("Evaluate"):
-            gr.Markdown(
-                "Benchmark the **currently loaded model** (set in the Chat tab) and compute "
-                "ROUGE-L scores.\n\n**Healthcare run** — Base 0.125 · SFT 0.242 (+0.118) · "
-                "DPO aligned (rewards/accuracy = 1.0)."
-            )
-            eval_questions_tb = gr.Textbox(label="Evaluation questions (one per line)",
-                                           value="\n".join(DEFAULT_EVAL_QUESTIONS), lines=6)
-            eval_btn = gr.Button("Run evaluation", variant="primary")
-            eval_log = gr.Textbox(label="Progress", lines=10)
-            eval_table = gr.Dataframe(label="Results", wrap=True)
-            eval_summary = gr.Textbox(label="Summary", lines=4)
-            eval_btn.click(run_evaluation, inputs=[eval_questions_tb, system_prompt_tb],
-                           outputs=[eval_log, eval_table, eval_summary])
+            with gr.Tabs():
+
+                # ── Single-model evaluation ──────────────────────────────────
+                with gr.Tab("Single model"):
+                    gr.Markdown(
+                        "Benchmark the **currently loaded model** (set in the Chat tab) and "
+                        "compute ROUGE-L scores."
+                    )
+                    eval_questions_tb = gr.Textbox(label="Evaluation questions (one per line)",
+                                                   value="\n".join(DEFAULT_EVAL_QUESTIONS), lines=6)
+                    eval_btn = gr.Button("Run evaluation", variant="primary")
+                    eval_log = gr.Textbox(label="Progress", lines=10)
+                    eval_table = gr.Dataframe(label="Results", wrap=True)
+                    eval_summary = gr.Textbox(label="Summary", lines=4)
+                    eval_btn.click(run_evaluation, inputs=[eval_questions_tb, system_prompt_tb],
+                                   outputs=[eval_log, eval_table, eval_summary])
+
+                # ── Three-way Base vs SFT vs DPO comparison ──────────────────
+                with gr.Tab("Compare Base · SFT · DPO"):
+                    gr.Markdown(
+                        "Runs the **same questions through all three models** — Base, SFT, and DPO — "
+                        "and shows their answers side by side, exactly like the DPO notebook's final "
+                        "comparison. ROUGE-L is measured against the DPO answer as reference.\n\n"
+                        "Uses your freshly trained models when available, otherwise the Hub "
+                        "Healthcare pipeline. This loads three models, so allow a little time."
+                    )
+                    tw_questions_tb = gr.Textbox(label="Questions (one per line)",
+                                                 value="\n".join(DEFAULT_EVAL_QUESTIONS), lines=6)
+                    tw_tokens_sl = gr.Slider(50, 300, value=180, step=10, label="Max tokens per answer")
+                    tw_btn = gr.Button("Run 3-way comparison", variant="primary")
+                    tw_log = gr.Textbox(label="Models used", lines=4)
+                    tw_table = gr.Dataframe(label="Base vs SFT vs DPO — answers side by side", wrap=True)
+                    tw_summary = gr.Textbox(label="Summary", lines=5)
+                    tw_btn.click(run_three_way_eval,
+                                 inputs=[tw_questions_tb, system_prompt_tb, tw_tokens_sl],
+                                 outputs=[tw_log, tw_table, tw_summary])
 
         # ══════════════════════════════ EXPORT ════════════════════════════════
         with gr.Tab("Export"):
