@@ -56,8 +56,37 @@ SUPPORTED_BASE_MODELS = {
 OUTPUT_ROOT = "/content/finetuning_studio"
 REPORTS_DIR = f"{OUTPUT_ROOT}/reports"
 SRC_DIR     = f"{OUTPUT_ROOT}/src"
-for d in (OUTPUT_ROOT, REPORTS_DIR, SRC_DIR):
+UPLOAD_DIR  = f"{OUTPUT_ROOT}/uploads"
+for d in (OUTPUT_ROOT, REPORTS_DIR, SRC_DIR, UPLOAD_DIR):
     os.makedirs(d, exist_ok=True)
+
+# Registry of every dataset the user has uploaded this session: {display_name: path}
+_uploaded_files = {}
+
+def register_uploads(file_list):
+    """Copy uploaded files into the workspace and register them. Returns a status + choices."""
+    import shutil
+    if not file_list:
+        return "_No files uploaded yet._", gr.update(choices=list(_uploaded_files.keys()))
+    added = []
+    for f in file_list:
+        src = f.name if hasattr(f, "name") else f
+        base = os.path.basename(src)
+        dest = os.path.join(UPLOAD_DIR, base)
+        try:
+            if os.path.abspath(src) != os.path.abspath(dest):
+                shutil.copy(src, dest)
+        except Exception:
+            dest = src
+        _uploaded_files[base] = dest
+        added.append(base)
+    lines = "\n".join(f"• {name}" for name in _uploaded_files.keys())
+    status = f"**{len(_uploaded_files)} file(s) available:**\n\n{lines}"
+    return status, gr.update(choices=list(_uploaded_files.keys()),
+                             value=added[-1] if added else None)
+
+def uploaded_choices():
+    return list(_uploaded_files.keys())
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a knowledgeable and empathetic assistant. Provide accurate, "
@@ -448,7 +477,11 @@ def train_one_stage(
         yield emit(f"❌ Could not resolve input model: {input_model_choice}")
         yield emit("   If it is a 'Trained · …' model, train that stage first.")
         return
-    if input_model_choice.startswith("Trained ·") and not os.path.exists(str(input_model)):
+    # A transient custom entry (__custom__) points at a HF repo id, which is not on
+    # disk — skip the existence check for those; only enforce it for real local runs.
+    _is_custom_repo = "__custom__" in input_model_choice
+    if (input_model_choice.startswith("Trained ·") and not _is_custom_repo
+            and not os.path.exists(str(input_model))):
         yield emit(f"❌ The selected trained model no longer exists on disk: {input_model}")
         return
 
@@ -928,174 +961,236 @@ def on_stage_change(stage):
         gr.update(value=input_hint),           # input_model_dd
     )
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-# GRADIO UI — clean, editorial, no persistent sidebar
+# CUSTOM MODEL BY NAME — load any HF repo id or local path the user types
+# ═════════════════════════════════════════════════════════════════════════════
+
+def load_custom_by_name(repo_or_path: str, progress=gr.Progress()):
+    """Load any model the user types: a HuggingFace repo id or a local path."""
+    if not repo_or_path or not repo_or_path.strip():
+        return "⚠️ Enter a HuggingFace repo id (e.g. ekblaise/my-model) or a local path."
+    rid = repo_or_path.strip()
+    progress(0.2, desc=f"Loading {rid}...")
+    ok, msg = _load_model(rid, f"Custom · {rid}")
+    progress(1.0)
+    return msg
+
+
+def resolve_input_with_custom(choice: str, custom_name: str):
+    """
+    Resolve the training input model. If the user chose the 'Custom name…' option,
+    use the typed repo id / path; otherwise fall back to the normal resolver.
+    """
+    if choice == "Custom name / HF repo…":
+        rid = (custom_name or "").strip()
+        return rid if rid else None
+    return _resolve_input_model(choice)
+
+
+def input_choices_with_custom():
+    return _models_available_as_input() + ["Custom name / HF repo…"]
+
+
+class _FileRef:
+    """Minimal stand-in for a Gradio File object (has a .name attribute)."""
+    def __init__(self, path): self.name = path
+
+
+def train_stage_ui(
+    stage, domain_name, input_model_choice, custom_input_name, run_name,
+    dataset_choice,
+    lora_r, lora_alpha, learning_rate, max_steps,
+    push_to_hub, hub_repo_name,
+    progress=gr.Progress(),
+):
+    """
+    UI-facing wrapper:
+      • resolves a custom HF repo id as the input model when chosen
+      • takes the dataset the user selected from their uploaded files and routes it
+        to the right slot for the stage (corpus for CPT, jsonl for SFT/DPO)
+    then delegates to train_one_stage (generator).
+    """
+    # ── Resolve the input model (supports 'Custom name / HF repo…') ──────────
+    if input_model_choice == "Custom name / HF repo…":
+        rid = (custom_input_name or "").strip()
+        if not rid:
+            yield "❌ You chose 'Custom name / HF repo…' but left the name blank."
+            return
+        _trained_registry[f"__custom__{rid}"] = {"path": rid, "stage": "PT", "domain": (domain_name or "custom")}
+        effective_choice = f"Trained · __custom__{rid}"
+    else:
+        effective_choice = input_model_choice
+
+    # ── Resolve the selected dataset file ────────────────────────────────────
+    dataset_path = _uploaded_files.get(dataset_choice) if dataset_choice else None
+    corpus_used = instruction_file = preference_file = None
+
+    if stage == "Pre-training (domain adaptation)":
+        if dataset_path:
+            # Extract + clean into the corpus text file the trainer reads
+            _prev, _status, _badge = process_upload(_FileRef(dataset_path))
+        corpus_used = True
+    elif stage == "SFT (instruction tuning)":
+        if not dataset_path:
+            yield "❌ Select an instruction dataset (.jsonl) from your uploaded files first."
+            return
+        instruction_file = _FileRef(dataset_path)
+    elif stage == "DPO (alignment)":
+        if not dataset_path:
+            yield "❌ Select a preference dataset (.jsonl) from your uploaded files first."
+            return
+        preference_file = _FileRef(dataset_path)
+
+    yield from train_one_stage(
+        stage, domain_name, effective_choice, run_name,
+        lora_r, lora_alpha, learning_rate, max_steps,
+        corpus_used, instruction_file, preference_file,
+        push_to_hub, hub_repo_name, progress,
+    )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GRADIO UI — three-panel studio (nav · left rail · center · right monitor)
 # ═════════════════════════════════════════════════════════════════════════════
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,500;0,6..72,600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ══ Force a single light, calm palette regardless of OS/browser dark mode ══ */
+/* ══ Palette — warm-neutral studio, single restrained accent ══ */
 :root, .dark {
-    --acc:       #0f766e;   /* deep teal, used sparingly            */
-    --acc-soft:  #f0f7f6;   /* barely-there teal tint               */
-    --ink:       #17211e;   /* near-black text                      */
-    --muted:     #64726e;   /* secondary text                       */
-    --line:      #e6eae8;   /* hairline borders                     */
-    --paper:     #ffffff;   /* main background                      */
-    --paper-2:   #fafbfb;   /* subtle panel background              */
+    --acc:#5b6cff; --acc-2:#7c5cff; --acc-soft:#eef0ff;
+    --ink:#1b1d29; --muted:#6b7280; --faint:#9aa1ad;
+    --line:#eceef2; --line-2:#e2e5eb;
+    --paper:#ffffff; --rail:#f7f8fb; --rail-2:#f1f3f8; --mono:#0e1526;
 
     --body-background-fill:#ffffff !important;
     --background-fill-primary:#ffffff !important;
-    --background-fill-secondary:#fafbfb !important;
+    --background-fill-secondary:#f7f8fb !important;
     --block-background-fill:#ffffff !important;
     --block-label-background-fill:transparent !important;
-    --block-label-text-color:#64726e !important;
-    --block-title-text-color:#17211e !important;
-    --body-text-color:#17211e !important;
-    --body-text-color-subdued:#64726e !important;
-    --border-color-primary:#e6eae8 !important;
+    --block-label-text-color:#6b7280 !important;
+    --block-title-text-color:#1b1d29 !important;
+    --body-text-color:#1b1d29 !important;
+    --body-text-color-subdued:#6b7280 !important;
+    --border-color-primary:#eceef2 !important;
     --input-background-fill:#ffffff !important;
-    --checkbox-background-color-selected:#0f766e !important;
-    --color-accent:#0f766e !important;
-    --color-accent-soft:#f0f7f6 !important;
-    --link-text-color:#0f766e !important;
+    --color-accent:#5b6cff !important;
+    --color-accent-soft:#eef0ff !important;
+    --link-text-color:#5b6cff !important;
 }
+body,.gradio-container,.dark body,.dark .gradio-container{background:#ffffff !important;color:#1b1d29 !important;}
+.gradio-container{max-width:100% !important;padding:0 !important;font-family:'Inter',-apple-system,sans-serif !important;}
+p,span,label,li,td,th,.prose,.prose *,textarea,input,.markdown,.markdown *,h1,h2,h3,h4{color:#1b1d29;}
+.markdown a,a{color:#5b6cff !important;text-decoration:none;}
+.markdown a:hover,a:hover{text-decoration:underline;}
 
-body, .gradio-container, .dark body, .dark .gradio-container {
-    background:#ffffff !important; color:#17211e !important;
-}
-.gradio-container {
-    max-width:1200px !important; margin:auto !important;
-    font-family:'Inter',-apple-system,sans-serif !important;
-}
+/* ══ Navbar ══ */
+#nav{display:flex;align-items:center;gap:14px;padding:13px 24px;
+    border-bottom:1px solid var(--line);background:#ffffff;position:sticky;top:0;z-index:50;}
+#nav .logo{width:32px;height:32px;border-radius:9px;flex:none;
+    background:linear-gradient(135deg,var(--acc),var(--acc-2));
+    display:flex;align-items:center;justify-content:center;color:#fff !important;
+    font-weight:700;font-size:0.95rem;font-family:'Newsreader',serif;
+    box-shadow:0 2px 8px rgba(91,108,255,.28);}
+#nav .brand{font-weight:600;font-size:1.06rem;color:#1b1d29 !important;letter-spacing:-0.01em;}
+#nav .brand small{display:block;font-weight:400;font-size:0.72rem;color:#9aa1ad !important;margin-top:-2px;}
+#nav .spacer{flex:1;}
+#nav .chip{font-size:0.72rem;padding:5px 11px;border-radius:20px;background:var(--rail-2);
+    color:#6b7280 !important;border:1px solid var(--line);font-weight:500;}
+#nav .chip.on{background:var(--acc-soft);color:var(--acc) !important;border-color:rgba(91,108,255,.25);}
 
-/* text never washes out on white */
-p, span, label, li, td, th, .prose, .prose *, textarea, input,
-.markdown, .markdown *, h1, h2, h3, h4 { color:#17211e; }
-.markdown a, a { color:#0f766e !important; }
+/* ══ Rails & center ══ */
+#rail-l,#rail-r{background:var(--rail);}
+#rail-l{border-right:1px solid var(--line);padding:20px 16px !important;}
+#rail-r{border-left:1px solid var(--line);padding:20px 16px !important;}
+#center{padding:22px 26px !important;}
 
-/* ── Header ─────────────────────────────────────────────── */
-#hdr { padding:30px 2px 22px; border-bottom:1px solid var(--line); margin-bottom:26px; }
-#hdr-title {
-    font-family:'Newsreader',Georgia,serif !important;
-    font-size:2.15rem !important; font-weight:600 !important;
-    letter-spacing:-0.02em; color:#17211e !important; margin:0 0 7px !important; line-height:1.1;
-}
-#hdr-sub { font-size:0.95rem !important; color:#64726e !important; margin:0 !important; max-width:640px; }
+/* section heading in rails (plain, no numbers) */
+.rail-h{font-size:0.72rem !important;font-weight:600 !important;letter-spacing:0.07em;
+    text-transform:uppercase;color:#9aa1ad !important;margin:4px 2px 10px !important;}
 
-/* ── Kill the ugly filled label pills — labels are plain text ── */
-.block > label > span,
-span[data-testid="block-info"],
-.gr-form > div > label span,
-label.svelte-1gfkn6j,
-.wrap.svelte-1gfkn6j > label {
-    background:transparent !important;
-    color:#64726e !important;
-    font-size:0.8rem !important;
-    font-weight:500 !important;
-    padding-left:0 !important;
-}
+/* soft elevated card */
+.card, .rail-card{background:#ffffff;border:1px solid var(--line);border-radius:14px;
+    padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(20,25,45,.04),0 4px 16px rgba(20,25,45,.03);}
 
-/* ── Radio & checkbox: clean cards, subtle selected state (no big teal fill) ── */
-fieldset label, .gr-radio label, .wrap label {
-    background:#ffffff !important;
-    border:1px solid var(--line) !important;
-    border-radius:9px !important;
-    padding:9px 13px !important;
-    color:#17211e !important;
-    font-weight:450 !important;
-    transition:border-color .15s, background .15s;
-}
-fieldset label:hover, .gr-radio label:hover { border-color:#c9d3d0 !important; }
-fieldset label.selected, .gr-radio label.selected,
-input[type="radio"]:checked + span {
-    background:var(--acc-soft) !important;
-    border-color:var(--acc) !important;
-    color:#0f766e !important;
-    font-weight:500 !important;
-}
+/* ══ Buttons ══ */
+button.primary,.gr-button-primary{
+    background:linear-gradient(135deg,var(--acc),var(--acc-2)) !important;color:#fff !important;
+    border:none !important;border-radius:10px !important;font-weight:550 !important;
+    box-shadow:0 2px 8px rgba(91,108,255,.25) !important;transition:opacity .15s,transform .08s,box-shadow .15s;}
+button.primary:hover{opacity:.95;box-shadow:0 4px 14px rgba(91,108,255,.35) !important;}
+button.primary:active{transform:scale(.985);}
+button.secondary{background:#fff !important;color:#1b1d29 !important;border:1px solid var(--line-2) !important;
+    border-radius:10px !important;font-weight:500 !important;box-shadow:none !important;}
+button.secondary:hover{border-color:var(--acc) !important;color:var(--acc) !important;}
 
-/* ── Buttons ─────────────────────────────────────────────── */
-button.primary, .gr-button-primary {
-    background:#17211e !important; color:#fff !important; border:none !important;
-    border-radius:9px !important; font-weight:500 !important; box-shadow:none !important;
-    transition:opacity .15s, transform .08s;
-}
-button.primary:hover { opacity:.88; }
-button.primary:active { transform:scale(.985); }
-button.secondary {
-    background:#fff !important; color:#17211e !important;
-    border:1px solid var(--line) !important; border-radius:9px !important;
-    font-weight:500 !important; box-shadow:none !important;
-}
-button.secondary:hover { border-color:#c9d3d0 !important; }
+/* ══ Labels — no filled pills ══ */
+.block>label>span,span[data-testid="block-info"],.gr-form>div>label span{
+    background:transparent !important;color:#6b7280 !important;font-size:0.78rem !important;
+    font-weight:500 !important;padding-left:0 !important;}
 
-/* ── Inputs ──────────────────────────────────────────────── */
-.block, .gr-box { border-radius:11px !important; box-shadow:none !important; border-color:var(--line) !important; }
-textarea, input[type="text"], input[type="number"], .gr-dropdown {
-    border-radius:9px !important; border:1px solid var(--line) !important;
-    background:#fff !important; font-family:'Inter',sans-serif !important;
-}
-textarea:focus, input:focus {
-    border-color:var(--acc) !important; box-shadow:0 0 0 3px var(--acc-soft) !important; outline:none !important;
-}
+/* ══ Inputs ══ */
+.block,.gr-box{border-radius:12px !important;box-shadow:none !important;border-color:var(--line) !important;}
+textarea,input[type="text"],input[type="number"],.gr-dropdown{
+    border-radius:10px !important;border:1px solid var(--line-2) !important;background:#fff !important;
+    font-family:'Inter',sans-serif !important;}
+textarea:focus,input:focus{border-color:var(--acc) !important;box-shadow:0 0 0 3px var(--acc-soft) !important;outline:none !important;}
 
-/* ── Tabs — underline style ──────────────────────────────── */
-.tabs { border:none !important; }
-.tab-nav { border-bottom:1px solid var(--line) !important; gap:2px; }
-.tab-nav button {
-    font-weight:500 !important; font-size:0.92rem !important; color:#64726e !important;
-    border:none !important; border-bottom:2px solid transparent !important;
-    border-radius:0 !important; padding:11px 18px !important; background:transparent !important;
-}
-.tab-nav button.selected { color:#17211e !important; border-bottom:2px solid var(--acc) !important; }
+/* radio/checkbox as clean cards */
+fieldset label,.gr-radio label,.wrap label{background:#fff !important;border:1px solid var(--line-2) !important;
+    border-radius:10px !important;padding:9px 12px !important;color:#1b1d29 !important;font-weight:450 !important;
+    transition:border-color .15s,background .15s;}
+fieldset label:hover,.gr-radio label:hover{border-color:#c9cdf6 !important;}
+fieldset label.selected,.gr-radio label.selected,input[type="radio"]:checked+span{
+    background:var(--acc-soft) !important;border-color:var(--acc) !important;color:var(--acc) !important;font-weight:550 !important;}
 
-/* ── Step number badges in the Train flow ────────────────── */
-.step-label { font-weight:600 !important; font-size:0.95rem !important; color:#17211e !important; margin:6px 0 2px !important; }
-.step-hint  { color:#64726e !important; font-size:0.85rem !important; margin:0 0 6px !important; }
+/* file dropzone */
+.gr-file, [class*="file"]{border-radius:12px !important;border:1.5px dashed var(--line-2) !important;background:var(--rail) !important;}
+.gr-file:hover{border-color:var(--acc) !important;}
 
-/* ── Status pill ─────────────────────────────────────────── */
-.status-pill {
-    font-size:0.85rem !important; padding:10px 14px; border-radius:9px;
-    background:var(--acc-soft) !important; border:1px solid rgba(15,118,110,.15); margin-top:6px;
-}
-.status-pill p { color:#0f766e !important; margin:0 !important; font-weight:500; }
+/* ══ Tabs — pill nav ══ */
+.tabs{border:none !important;}
+.tab-nav{border-bottom:1px solid var(--line) !important;gap:4px;padding-bottom:2px;}
+.tab-nav button{font-weight:500 !important;font-size:0.9rem !important;color:#6b7280 !important;
+    border:none !important;border-bottom:2px solid transparent !important;border-radius:8px 8px 0 0 !important;
+    padding:9px 16px !important;background:transparent !important;}
+.tab-nav button:hover{color:#1b1d29 !important;background:var(--rail-2) !important;}
+.tab-nav button.selected{color:var(--acc) !important;border-bottom:2px solid var(--acc) !important;background:transparent !important;}
 
-/* ── Dataframe + examples ────────────────────────────────── */
-/* ── Dataframe — force readable light cells (fixes dark-on-dark) ──────── */
-table { border-radius:9px !important; overflow:hidden; border:1px solid var(--line) !important; }
-.gr-dataframe, .gr-dataframe *, [class*="dataframe"] table, [class*="dataframe"] * {
-    background:#ffffff !important;
-    color:#17211e !important;
-}
-.gr-dataframe thead th, [class*="dataframe"] thead th, thead th {
-    background:#f2f5f4 !important;
-    color:#17211e !important;
-    font-weight:600 !important;
-    border-bottom:1px solid var(--line) !important;
-}
-.gr-dataframe tbody td, [class*="dataframe"] tbody td, tbody td {
-    background:#ffffff !important;
-    color:#17211e !important;
-    border-bottom:1px solid #eef1f0 !important;
-}
-.gr-dataframe tbody tr:nth-child(even) td,
-[class*="dataframe"] tbody tr:nth-child(even) td {
-    background:#fafbfb !important;
-}
-.gr-dataframe tbody tr:hover td, [class*="dataframe"] tbody tr:hover td {
-    background:#f0f7f6 !important;
-}
-.gr-samples-table button {
-    border-radius:20px !important; border:1px solid var(--line) !important;
-    background:#fff !important; color:#17211e !important; font-size:0.8rem !important;
-}
-.gr-samples-table button:hover { border-color:var(--acc) !important; background:var(--acc-soft) !important; }
+/* ══ Chat surface ══ */
+#chat-answer textarea{background:#fff !important;border:1px solid var(--line) !important;border-radius:14px !important;
+    font-size:0.96rem !important;line-height:1.6 !important;min-height:260px;padding:16px !important;
+    box-shadow:0 1px 2px rgba(20,25,45,.04);}
 
-/* ── Slim divider + footer ───────────────────────────────── */
-.slim-divider { border:none; border-top:1px solid var(--line); margin:22px 0 18px; }
-#footer { color:#64726e !important; font-size:0.8rem !important; text-align:center; padding:26px 0 6px; }
+/* ══ Live monitor — terminal ══ */
+#monitor textarea{background:#0e1526 !important;color:#8ee6c8 !important;border:1px solid #1c2740 !important;
+    border-radius:12px !important;font-family:'JetBrains Mono',monospace !important;font-size:0.76rem !important;
+    line-height:1.55 !important;padding:14px !important;}
+
+/* status pill */
+.status-pill{font-size:0.82rem !important;padding:10px 13px;border-radius:10px;background:var(--acc-soft) !important;
+    border:1px solid rgba(91,108,255,.16);margin-top:8px;}
+.status-pill p{color:var(--acc) !important;margin:0 !important;font-weight:500;}
+
+/* uploaded-files list */
+.filelist{font-size:0.83rem !important;line-height:1.7;}
+.filelist strong{color:#1b1d29 !important;font-weight:600;}
+
+/* ══ Dataframe — readable ══ */
+table{border-radius:12px !important;overflow:hidden;border:1px solid var(--line) !important;}
+.gr-dataframe,.gr-dataframe *,[class*="dataframe"] table,[class*="dataframe"] *{background:#fff !important;color:#1b1d29 !important;}
+.gr-dataframe thead th,[class*="dataframe"] thead th,thead th{background:#f4f5f9 !important;color:#1b1d29 !important;font-weight:600 !important;border-bottom:1px solid var(--line) !important;}
+.gr-dataframe tbody td,[class*="dataframe"] tbody td,tbody td{background:#fff !important;color:#1b1d29 !important;border-bottom:1px solid #f0f1f5 !important;}
+.gr-dataframe tbody tr:nth-child(even) td,[class*="dataframe"] tbody tr:nth-child(even) td{background:#fafbfd !important;}
+.gr-dataframe tbody tr:hover td,[class*="dataframe"] tbody tr:hover td{background:var(--acc-soft) !important;}
+
+/* examples chips */
+.gr-samples-table button{border-radius:20px !important;border:1px solid var(--line-2) !important;background:#fff !important;color:#1b1d29 !important;font-size:0.8rem !important;}
+.gr-samples-table button:hover{border-color:var(--acc) !important;background:var(--acc-soft) !important;}
+
+.step-label{font-weight:600 !important;font-size:0.9rem !important;color:#1b1d29 !important;margin:10px 0 2px !important;}
+.step-hint{color:#6b7280 !important;font-size:0.82rem !important;margin:0 0 6px !important;}
+.slim-divider{border:none;border-top:1px solid var(--line);margin:18px 0;}
 """
 
 THEME = gr.themes.Soft(
@@ -1106,13 +1201,9 @@ THEME = gr.themes.Soft(
     radius_size=gr.themes.sizes.radius_md,
 )
 _theme_overrides = dict(
-    body_background_fill="#ffffff",
-    block_background_fill="#ffffff",
-    block_label_background_fill="#ffffff",
-    block_border_width="1px",
-    block_border_color="#e6eae8",
-    block_shadow="none",
-    input_background_fill="#ffffff",
+    body_background_fill="#ffffff", block_background_fill="#ffffff",
+    block_label_background_fill="#ffffff", block_border_width="1px",
+    block_border_color="#e4e9e7", block_shadow="none", input_background_fill="#ffffff",
 )
 try:
     THEME = THEME.set(**_theme_overrides)
@@ -1124,242 +1215,226 @@ except TypeError:
 
 with gr.Blocks(title="Fine-Tuning Studio", theme=THEME, css=CUSTOM_CSS) as demo:
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    with gr.Column(elem_id="hdr"):
-        gr.Markdown("Fine-Tuning Studio", elem_id="hdr-title")
-        gr.Markdown(
-            "Converse with the pre-trained Healthcare pipeline on HuggingFace Hub, "
-            "or fine-tune a brand-new assistant on your own domain — one workspace, "
-            "a three-stage pipeline (domain adaptation → instruction tuning → DPO).",
-            elem_id="hdr-sub",
-        )
+    # ══════════════════════════════ NAVBAR ════════════════════════════════════
+    gr.HTML("""
+    <div id="nav">
+      <div class="logo">FS</div>
+      <div class="brand">Fine-Tuning Studio</div>
+      <div class="spacer"></div>
+      <div class="chip">Unsloth</div>
+      <div class="chip">QLoRA</div>
+      <div class="chip on">T4 · 4-bit</div>
+    </div>
+    """)
 
-    with gr.Tabs():
+    with gr.Row(equal_height=False):
 
-        # ══════════════════════════════ CHAT ══════════════════════════════════
-        with gr.Tab("Chat"):
-            gr.Markdown("#### Choose a model")
-            with gr.Row():
-                model_dd = gr.Dropdown(
-                    choices=all_model_choices(),
-                    value="Healthcare · DPO — Final (Hub)",
-                    label="Model", scale=5,
+        # ══════════════════════ LEFT RAIL — model + data ═════════════════════
+        with gr.Column(scale=2, min_width=300, elem_id="rail-l"):
+
+            with gr.Column(elem_classes="card"):
+                project_name = gr.Textbox(label="Project / domain name",
+                                          placeholder="e.g. Healthcare, Legal...")
+                model_source = gr.Radio(
+                    choices=["My Hub models (ekblaise)", "Predefined base model", "Custom name / HF repo"],
+                    value="My Hub models (ekblaise)", label="Load model from",
                 )
-                refresh_btn = gr.Button("↻", variant="secondary", scale=1, min_width=48)
-                load_btn = gr.Button("Load", variant="primary", scale=1, min_width=110)
-            load_status = gr.Markdown("_No model loaded yet._", elem_classes="status-pill")
-            load_btn.click(resolve_and_load, inputs=[model_dd], outputs=[load_status])
-            refresh_btn.click(refresh_model_dropdown, inputs=[], outputs=[model_dd])
+                hub_model_dd = gr.Dropdown(choices=all_model_choices(),
+                                           value="Healthcare · DPO — Final (Hub)",
+                                           label="Model", visible=True)
+                base_model_dd2 = gr.Dropdown(choices=list(SUPPORTED_BASE_MODELS.keys()),
+                                             value=list(SUPPORTED_BASE_MODELS.keys())[0],
+                                             label="Model", visible=False)
+                custom_name_tb = gr.Textbox(label="HF repo id or local path",
+                                            placeholder="ekblaise/my-model", visible=False)
+                with gr.Row():
+                    refresh_btn = gr.Button("↻", variant="secondary", min_width=44, scale=1)
+                    load_btn    = gr.Button("Load model", variant="primary", scale=3)
+                load_status = gr.Markdown("_No model loaded._", elem_classes="status-pill")
+
+            with gr.Column(elem_classes="card"):
+                gr.Markdown("Upload any files: PDF/DOCX/CSV/TXT/JSON/JSONL, "
+                            "Pick model in Train tab.",
+                            elem_classes="step-hint")
+                upload_files = gr.File(label="Upload datasets", file_count="multiple",
+                                       file_types=[".pdf", ".docx", ".doc", ".csv", ".txt", ".jsonl", ".json"])
+                files_list = gr.Markdown("_No files uploaded yet._", elem_classes="filelist")
 
             with gr.Accordion("Generation settings", open=False):
                 system_prompt_tb = gr.Textbox(label="System prompt", value=DEFAULT_SYSTEM_PROMPT, lines=3)
-                with gr.Row():
-                    max_tokens_sl  = gr.Slider(50, 400, value=200, step=10, label="Max response tokens")
-                    temperature_sl = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="Temperature")
+                max_tokens_sl  = gr.Slider(50, 400, value=200, step=10, label="Max tokens")
+                temperature_sl = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="Temperature")
 
-            gr.Markdown('<hr class="slim-divider">')
-
+        # ══════════════════════ CENTER — main panel ═════════════════════════
+        with gr.Column(scale=6, min_width=520, elem_id="center"):
             with gr.Tabs():
-                with gr.Tab("Ask"):
-                    chat_q = gr.Textbox(label="Your question", lines=2,
-                                        placeholder="What is the first-line treatment for type 2 diabetes?")
-                    ask_btn = gr.Button("Ask", variant="primary")
-                    chat_out = gr.Textbox(label="Answer", lines=10)
-                    chat_status = gr.Textbox(label="Status", lines=1)
-                    ask_btn.click(chat_answer,
-                                  inputs=[chat_q, system_prompt_tb, max_tokens_sl, temperature_sl],
-                                  outputs=[chat_out, chat_status])
+
+                # ── CHAT ──────────────────────────────────────────────────────
+                with gr.Tab("Chat"):
+                    chat_out = gr.Textbox(label="Assistant", lines=12, elem_id="chat-answer",
+                                          placeholder="Load a model in the left rail, then ask a question below.")
+                    with gr.Row():
+                        chat_q = gr.Textbox(label="", placeholder="Ask a question…", scale=6, container=False)
+                        ask_btn = gr.Button("Send", variant="primary", scale=1, min_width=90)
+                    chat_status = gr.Markdown("", elem_classes="status-pill")
                     gr.Examples(examples=[[q] for q in DEFAULT_EVAL_QUESTIONS[:6]], inputs=[chat_q])
 
-                with gr.Tab("Compare stages"):
-                    gr.Markdown(
-                        "Runs the same question through **Base → SFT → DPO**. Uses your freshly "
-                        "trained model when available, otherwise the Hub Healthcare pipeline."
+                # ── TRAIN ─────────────────────────────────────────────────────
+                with gr.Tab("Train"):
+                    gr.Markdown("Train **one stage at a time**. Each finished model is registered "
+                                "and can feed the next stage or be chatted with.", elem_classes="step-hint")
+
+                    stage_dd = gr.Radio(
+                        choices=["Pre-training", "SFT (instruction tuning)", "DPO (alignment)"],
+                        value="Pre-training", label="",
                     )
-                    cmp_q = gr.Textbox(label="Question to compare", lines=2)
-                    cmp_btn = gr.Button("Run comparison", variant="primary")
-                    cmp_stat = gr.Textbox(label="Status", lines=1)
+
+                    gr.Markdown("Input model", elem_classes="step-label")
+                    gr.Markdown("Foundation model for CPT; a previously trained model for SFT/DPO; "
+                                "or type any HF repo id.", elem_classes="step-hint")
                     with gr.Row():
-                        cmp_base = gr.Textbox(label="Base", lines=12)
-                        cmp_sft  = gr.Textbox(label="SFT",  lines=12)
-                        cmp_dpo  = gr.Textbox(label="DPO",  lines=12)
-                    cmp_btn.click(compare_answer, inputs=[cmp_q, system_prompt_tb, max_tokens_sl],
-                                  outputs=[cmp_base, cmp_sft, cmp_dpo, cmp_stat])
-                    gr.Examples(examples=[[q] for q in DEFAULT_EVAL_QUESTIONS[:3]], inputs=[cmp_q])
+                        input_model_dd = gr.Dropdown(choices=input_choices_with_custom(),
+                                                     value=f"Foundation · {list(SUPPORTED_BASE_MODELS.keys())[0]}",
+                                                     label="", scale=5)
+                        input_refresh_btn = gr.Button("↻", variant="secondary", scale=1, min_width=44)
+                    custom_input_tb = gr.Textbox(label="Custom HF repo id (if selected above)",
+                                                 placeholder="ekblaise/healthcare-qwen2.5-stage2-merged", visible=False)
 
-        # ══════════════════════════════ TRAIN ═════════════════════════════════
-        with gr.Tab("Train a new model"):
-            gr.Markdown(
-                "Train **one stage at a time**. Each finished model is saved and added to the "
-                "model list — so you can feed a pre-trained model into SFT, an SFT model into DPO, "
-                "and train as many models as you like."
-            )
+                    with gr.Row():
+                        run_name_tb   = gr.Textbox(label="Run name (optional)",
+                                                   placeholder="auto-generated if blank", scale=1)
+                        dataset_dd    = gr.Dropdown(choices=uploaded_choices(), label="Dataset for this stage",
+                                                    value=None, scale=1)
 
-            gr.Markdown("Step 1 · Name & domain", elem_classes="step-label")
-            gr.Markdown("The run name identifies this model in the lists. Domain shapes the system prompt.",
-                        elem_classes="step-hint")
-            with gr.Row():
-                domain_name_tb = gr.Textbox(label="Domain", placeholder="e.g. Legal, Finance, Nutrition…")
-                run_name_tb    = gr.Textbox(label="Run name (optional)", placeholder="auto-generated if blank")
+                    with gr.Accordion("Hyperparameters (stage defaults auto-applied)", open=False):
+                        with gr.Row():
+                            lora_r_sl     = gr.Slider(4, 64, value=16, step=4, label="LoRA r")
+                            lora_alpha_sl = gr.Slider(4, 128, value=32, step=4, label="LoRA alpha")
+                        with gr.Row():
+                            lr_sl    = gr.Slider(1e-5, 5e-4, value=2e-4, step=1e-5, label="Learning rate")
+                            steps_sl = gr.Slider(10, 300, value=60, step=10, label="Max steps")
 
-            gr.Markdown("Step 2 · Choose the stage to train", elem_classes="step-label")
-            gr.Markdown(
-                "Pre-training adapts a foundation model to your domain. SFT teaches instruction "
-                "following (input: a pre-trained model). DPO aligns preferences (input: an SFT model).",
-                elem_classes="step-hint",
-            )
-            stage_dd = gr.Radio(
-                choices=["Pre-training (domain adaptation)",
-                         "SFT (instruction tuning)",
-                         "DPO (alignment)"],
-                value="Pre-training (domain adaptation)",
-                label="Stage",
-            )
+                    with gr.Accordion("Push final model to HuggingFace (optional)", open=False):
+                        with gr.Row():
+                            push_cb     = gr.Checkbox(label=f"Push to {HF_USERNAME}", value=False)
+                            hub_repo_tb = gr.Textbox(label="Repo name", placeholder="legal-qwen2.5-dpo-final", scale=2)
 
-            gr.Markdown("Step 3 · Choose the input model", elem_classes="step-label")
-            gr.Markdown(
-                "For pre-training, pick a foundation model. For SFT or DPO, pick a model you've "
-                "already trained (the merged output of the previous stage). Press ↻ to refresh.",
-                elem_classes="step-hint",
-            )
-            with gr.Row():
-                input_model_dd = gr.Dropdown(
-                    choices=_models_available_as_input(),
-                    value=f"Foundation · {list(SUPPORTED_BASE_MODELS.keys())[0]}",
-                    label="Input model", scale=5,
-                )
-                input_refresh_btn = gr.Button("↻", variant="secondary", scale=1, min_width=48)
-            input_refresh_btn.click(refresh_input_dropdown, inputs=[], outputs=[input_model_dd])
+                    train_btn = gr.Button("Start training", variant="primary", size="lg")
 
-            gr.Markdown("Step 4 · Provide the dataset for this stage", elem_classes="step-label")
-            gr.Markdown("Only the dataset for the selected stage is shown.", elem_classes="step-hint")
-
-            # Pre-training corpus (visible for PT only)
-            with gr.Column(visible=True) as corpus_col:
-                gr.Markdown("**Raw corpus** — PDF, DOCX, CSV, TXT, or scanned PDF")
-                corpus_file  = gr.File(label="Raw corpus",
-                                       file_types=[".pdf", ".docx", ".doc", ".csv", ".txt"], show_label=False)
-                extract_btn  = gr.Button("Extract & preview", variant="secondary", size="sm")
-                corpus_badge = gr.Markdown("", visible=False, elem_classes="status-pill")
-                with gr.Accordion("Corpus extraction details", open=False):
-                    corpus_status = gr.Textbox(label="Extraction status", lines=5)
-                    corpus_prev   = gr.Textbox(label="Preview (first 3 paragraphs)", lines=8)
-                extract_btn.click(process_upload, inputs=[corpus_file],
-                                  outputs=[corpus_prev, corpus_status, corpus_badge])
-
-            # SFT instruction data (hidden until SFT selected)
-            with gr.Column(visible=False) as instr_col:
-                gr.Markdown("**Instruction pairs** — `.jsonl` with `instruction` / `output` fields")
-                instr_file = gr.File(label="Instruction data", file_types=[".jsonl", ".json"], show_label=False)
-
-            # DPO preference data (hidden until DPO selected)
-            with gr.Column(visible=False) as pref_col:
-                gr.Markdown("**Preference pairs** — `.jsonl` with `prompt` / `chosen` / `rejected` fields")
-                pref_file  = gr.File(label="Preference data", file_types=[".jsonl", ".json"], show_label=False)
-
-            with gr.Accordion("Advanced hyperparameters (stage defaults applied automatically)", open=False):
-                gr.Markdown(
-                    "Defaults follow the reference notebooks: **PT** r=16 α=32 LR=2e-4 · "
-                    "**SFT** LR=1e-4 · **DPO** LR=5e-5. Change only if you know why.",
-                    elem_classes="step-hint",
-                )
-                with gr.Row():
-                    lora_r_sl     = gr.Slider(4, 64, value=16, step=4, label="LoRA rank (r)")
-                    lora_alpha_sl = gr.Slider(4, 128, value=32, step=4, label="LoRA alpha")
-                with gr.Row():
-                    lr_sl    = gr.Slider(1e-5, 5e-4, value=2e-4, step=1e-5, label="Learning rate")
-                    steps_sl = gr.Slider(10, 300, value=60, step=10, label="Max steps")
-
-            # Wire the stage radio to swap defaults + toggle dataset visibility
-            stage_dd.change(
-                on_stage_change,
-                inputs=[stage_dd],
-                outputs=[lora_r_sl, lora_alpha_sl, lr_sl, steps_sl,
-                         corpus_col, instr_col, pref_col, input_model_dd],
-            )
-
-            gr.Markdown("Step 5 · (Optional) push final model to HuggingFace", elem_classes="step-label")
-            gr.Markdown(f"Pushes the merged model to your account (**{HF_USERNAME}**). "
-                        "Requires `notebook_login()` beforehand.", elem_classes="step-hint")
-            with gr.Row():
-                push_cb       = gr.Checkbox(label="Push to HuggingFace Hub after training", value=False)
-                hub_repo_tb   = gr.Textbox(label="Repo name",
-                                           placeholder="e.g. legal-qwen2.5-dpo-final", scale=2)
-
-            train_btn = gr.Button("Start training this stage", variant="primary", size="lg")
-            train_log = gr.Textbox(label="Training log", lines=22, max_lines=60, autoscroll=True)
-            train_btn.click(
-                train_one_stage,
-                inputs=[stage_dd, domain_name_tb, input_model_dd, run_name_tb,
-                        lora_r_sl, lora_alpha_sl, lr_sl, steps_sl,
-                        corpus_file, instr_file, pref_file, push_cb, hub_repo_tb],
-                outputs=[train_log],
-            )
-            gr.Markdown(
-                '<hr class="slim-divider">After a stage finishes, press ↻ on the input-model list '
-                'to feed it into the next stage, or press ↻ in the **Chat** tab to talk to it.'
-            )
-
-        # ══════════════════════════════ EVALUATE ══════════════════════════════
-        with gr.Tab("Evaluate"):
-            with gr.Tabs():
-
-                # ── Single-model evaluation ──────────────────────────────────
-                with gr.Tab("Single model"):
-                    gr.Markdown(
-                        "Benchmark the **currently loaded model** (set in the Chat tab) and "
-                        "compute ROUGE-L scores."
-                    )
-                    eval_questions_tb = gr.Textbox(label="Evaluation questions (one per line)",
+                # ── EVALUATE ──────────────────────────────────────────────────
+                with gr.Tab("Evaluate"):
+                    with gr.Tabs():
+                        with gr.Tab("Single model"):
+                            eval_q_tb = gr.Textbox(label="Questions (one per line)",
                                                    value="\n".join(DEFAULT_EVAL_QUESTIONS), lines=6)
-                    eval_btn = gr.Button("Run evaluation", variant="primary")
-                    eval_log = gr.Textbox(label="Progress", lines=10)
-                    eval_table = gr.Dataframe(label="Results", wrap=True)
-                    eval_summary = gr.Textbox(label="Summary", lines=4)
-                    eval_btn.click(run_evaluation, inputs=[eval_questions_tb, system_prompt_tb],
-                                   outputs=[eval_log, eval_table, eval_summary])
-
-                # ── Three-way Base vs SFT vs DPO comparison ──────────────────
-                with gr.Tab("Compare Base · SFT · DPO"):
-                    gr.Markdown(
-                        "Runs the **same questions through all three models** — Base, SFT, and DPO — "
-                        "and shows their answers side by side, exactly like the DPO notebook's final "
-                        "comparison. ROUGE-L is measured against the DPO answer as reference.\n\n"
-                        "Uses your freshly trained models when available, otherwise the Hub "
-                        "Healthcare pipeline. This loads three models, so allow a little time."
-                    )
-                    tw_questions_tb = gr.Textbox(label="Questions (one per line)",
+                            eval_btn = gr.Button("Run evaluation", variant="primary")
+                            eval_table = gr.Dataframe(label="Results", wrap=True)
+                            eval_summary = gr.Textbox(label="Summary", lines=4)
+                        with gr.Tab("Compare Base · SFT · DPO"):
+                            gr.Markdown("Runs the same questions through all three models side by side, "
+                                        "ROUGE-L measured against the DPO answer.", elem_classes="step-hint")
+                            tw_q_tb = gr.Textbox(label="Questions (one per line)",
                                                  value="\n".join(DEFAULT_EVAL_QUESTIONS), lines=6)
-                    tw_tokens_sl = gr.Slider(50, 300, value=180, step=10, label="Max tokens per answer")
-                    tw_btn = gr.Button("Run 3-way comparison", variant="primary")
-                    tw_log = gr.Textbox(label="Models used", lines=4)
-                    tw_table = gr.Dataframe(label="Base vs SFT vs DPO — answers side by side", wrap=True)
-                    tw_summary = gr.Textbox(label="Summary", lines=5)
-                    tw_btn.click(run_three_way_eval,
-                                 inputs=[tw_questions_tb, system_prompt_tb, tw_tokens_sl],
-                                 outputs=[tw_log, tw_table, tw_summary])
+                            tw_tokens = gr.Slider(50, 300, value=180, step=10, label="Max tokens/answer")
+                            tw_btn = gr.Button("Run 3-way comparison", variant="primary")
+                            tw_table = gr.Dataframe(label="Base vs SFT vs DPO", wrap=True)
+                            tw_summary = gr.Textbox(label="Summary", lines=5)
 
-        # ══════════════════════════════ EXPORT ════════════════════════════════
-        with gr.Tab("Export"):
-            gr.Markdown("Download your training artifacts as a single archive.")
-            inc_weights_cb = gr.Checkbox(label="Include merged model weights (~3GB per stage)", value=False)
-            export_btn = gr.Button("Create export ZIP", variant="primary")
-            export_file = gr.File(label="Download")
-            export_status = gr.Textbox(label="Contents", lines=12)
-            export_btn.click(make_export_zip, inputs=[inc_weights_cb], outputs=[export_file, export_status])
-            gr.Markdown(f"""
-            <hr class="slim-divider">
+                # ── PUBLISH ───────────────────────────────────────────────────
+                with gr.Tab("Publish"):
+                    gr.Markdown("Export your artifacts, or review the models published to the Hub.")
+                    inc_weights_cb = gr.Checkbox(label="Include merged weights (~3GB/stage)", value=False)
+                    export_btn = gr.Button("Create export ZIP", variant="primary")
+                    export_file = gr.File(label="Download")
+                    export_status = gr.Textbox(label="Contents", lines=8)
+                    gr.Markdown(f"""
+                    <hr class="slim-divider">
 
-            **HuggingFace Hub — pre-trained Healthcare pipeline ({HF_USERNAME})**
+                    **HuggingFace Hub — Healthcare pipeline ({HF_USERNAME})**
 
-            | Stage | Repo |
-            |---|---|
-            | Base (Stage 1) | [`{HF_REPOS['Base  (Stage 1 merged)']}`](https://huggingface.co/{HF_REPOS['Base  (Stage 1 merged)']}) |
-            | SFT (Stage 2)  | [`{HF_REPOS['SFT   (Stage 2 merged)']}`](https://huggingface.co/{HF_REPOS['SFT   (Stage 2 merged)']}) |
-            | DPO (Final)    | [`{HF_REPOS['DPO   (Final model)']}`](https://huggingface.co/{HF_REPOS['DPO   (Final model)']}) |
-            """)
+                    | Stage | Repo |
+                    |---|---|
+                    | Base | [`{HF_REPOS['Base  (Stage 1 merged)']}`](https://huggingface.co/{HF_REPOS['Base  (Stage 1 merged)']}) |
+                    | SFT  | [`{HF_REPOS['SFT   (Stage 2 merged)']}`](https://huggingface.co/{HF_REPOS['SFT   (Stage 2 merged)']}) |
+                    | DPO  | [`{HF_REPOS['DPO   (Final model)']}`](https://huggingface.co/{HF_REPOS['DPO   (Final model)']}) |
+                    """)
 
-    gr.Markdown("Fine-Tuning Studio · Unsloth + TRL + QLoRA + DPO", elem_id="footer")
+        # ══════════════════════ RIGHT RAIL — live monitor ════════════════════
+        with gr.Column(scale=3, min_width=300, elem_id="rail-r"):
+            gr.HTML('<div class="rail-h">Live monitor</div>')
+            train_log = gr.Textbox(label="", lines=22, max_lines=60, autoscroll=True,
+                                   elem_id="monitor", placeholder="Training logs stream here…")
+            gr.HTML('<div class="rail-h" style="margin-top:16px">Results</div>')
+            monitor_summary = gr.Textbox(label="", lines=6,
+                                         placeholder="Evaluation summaries appear here…")
+
+    # ═══════════════════════════ WIRING ═══════════════════════════════════════
+
+    # left-rail model source toggle
+    def _toggle_src(src):
+        return (gr.update(visible=src == "My Hub models (ekblaise)"),
+                gr.update(visible=src == "Predefined base model"),
+                gr.update(visible=src == "Custom name / HF repo"))
+    model_source.change(_toggle_src, inputs=[model_source],
+                        outputs=[hub_model_dd, base_model_dd2, custom_name_tb])
+
+    # left-rail load button routes by source
+    def _rail_load(src, hub_choice, base_choice, custom_name, progress=gr.Progress()):
+        if src == "My Hub models (ekblaise)":
+            return resolve_and_load(hub_choice, progress)
+        if src == "Predefined base model":
+            model_id = SUPPORTED_BASE_MODELS.get(base_choice)
+            ok, msg = _load_model(model_id, base_choice); return msg
+        return load_custom_by_name(custom_name, progress)
+    load_btn.click(_rail_load, inputs=[model_source, hub_model_dd, base_model_dd2, custom_name_tb],
+                   outputs=[load_status])
+    refresh_btn.click(refresh_model_dropdown, inputs=[], outputs=[hub_model_dd])
+
+    # datasets: any upload registers the file(s) and refreshes the Train dataset picker
+    upload_files.change(register_uploads, inputs=[upload_files],
+                        outputs=[files_list, dataset_dd])
+
+    # chat
+    ask_btn.click(chat_answer, inputs=[chat_q, system_prompt_tb, max_tokens_sl, temperature_sl],
+                  outputs=[chat_out, chat_status])
+    chat_q.submit(chat_answer, inputs=[chat_q, system_prompt_tb, max_tokens_sl, temperature_sl],
+                  outputs=[chat_out, chat_status])
+
+    # train: stage change → hyperparameter defaults + input-model hint.
+    # on_stage_change returns 8 updates; the 3 dataset-visibility ones are for columns
+    # that no longer exist here, so route them to hidden no-op sinks.
+    _sink1 = gr.Textbox(visible=False)
+    _sink2 = gr.Textbox(visible=False)
+    _sink3 = gr.Textbox(visible=False)
+    stage_dd.change(on_stage_change, inputs=[stage_dd],
+                    outputs=[lora_r_sl, lora_alpha_sl, lr_sl, steps_sl,
+                             _sink1, _sink2, _sink3, input_model_dd])
+
+    # refresh the dataset dropdown when the Train tab is used (pick up new uploads)
+    input_refresh_btn.click(lambda: (gr.update(choices=input_choices_with_custom()),
+                                      gr.update(choices=uploaded_choices())),
+                            inputs=[], outputs=[input_model_dd, dataset_dd])
+
+    # show custom-input textbox when 'Custom name…' selected
+    def _toggle_custom_input(choice):
+        return gr.update(visible=(choice == "Custom name / HF repo…"))
+    input_model_dd.change(_toggle_custom_input, inputs=[input_model_dd], outputs=[custom_input_tb])
+
+    train_btn.click(
+        train_stage_ui,
+        inputs=[stage_dd, project_name, input_model_dd, custom_input_tb, run_name_tb,
+                dataset_dd, lora_r_sl, lora_alpha_sl, lr_sl, steps_sl,
+                push_cb, hub_repo_tb],
+        outputs=[train_log],
+    )
+
+    # evaluate — single model + three-way comparison (stream progress to monitor)
+    eval_btn.click(run_evaluation, inputs=[eval_q_tb, system_prompt_tb],
+                   outputs=[train_log, eval_table, eval_summary])
+    tw_btn.click(run_three_way_eval, inputs=[tw_q_tb, system_prompt_tb, tw_tokens],
+                 outputs=[train_log, tw_table, tw_summary])
+
+    export_btn.click(make_export_zip, inputs=[inc_weights_cb], outputs=[export_file, export_status])
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

@@ -39,7 +39,7 @@ The model is trained to answer common medical questions across 8 clinical topic 
 2. Follows structured instruction-answer format reliably (Stage 2)
 3. Prefers safe, accurate, evidence-based responses over vague or misleading ones (Stage 3)
 
-**Use case:** Internal FAQ assistant for a clinic or hospital — answering patient and clinician questions about medications, conditions, and treatment protocols, with appropriate safety disclaimers triggered automatically.
+**Use case:** Internal FAQ assistant for a clinic or hospital - answering patient and clinician questions about medications, conditions, and treatment protocols, with appropriate safety disclaimers triggered automatically.
 
 ---
 
